@@ -33,9 +33,9 @@ what does each remaining hop owe?*
 | M1 — platform + backend | **MET** | `ctest -R 'rocm\|cross_device'` green on the board; RmsNorm ≤ 5e-4 vs CPU oracle (#41) |
 | W1 approach-(b) F6 fix | **VERIFIED on gfx1151 (2026-08-19)** — probe triple `1/1/true`, coupling + no-copy cases green, 9/9 cases / 1071 assertions | §3: `test_rocm_backend` on gtr9, evidence log `f6-verify-20260819-085638.log` |
 | M2 — first model e2e | **MET (2026-08-19), all-native** — Qwen3-0.6B runs end to end with **zero reference-tier fallbacks**; 2/4 prompts token-identical to CPU, 2 in the documented near-tie regime | §3: `m2-verify-20260819-085745.log`; the G3 kernel to-do for this model is empty |
-| M3 — kernels | **PARTIAL** | 44 ops registered (`src/vt/rocm/`, counted 2026-08-19). Attention half LANDED: `ROCM_ATTN` registration (#1056) + runner per-group selection/shape validation (#1065). GDN kernel families landed on the discrete lane (`CLAIM-ROCM-GDN-KERNELS`, 10 ops). d=128 decode arm LANDED default OFF (`VT_ATTN_DECODE_D128`, #767) |
+| M3 — kernels | **PARTIAL** | 44 ops registered (`src/vt/rocm/`, counted 2026-08-19). Attention half LANDED: `ROCM_ATTN` registration (#1056) + runner per-group selection/shape validation (#1065). GDN kernel families landed on the discrete lane (`CLAIM-ROCM-GDN-KERNELS`, 10 ops). d=128 decode arm LANDED default OFF (`VT_ATTN_DECODE_D128`, #767), **flipped default ON upstream as #1589** (2026-08-21) |
 | M4 — correctness vs vLLM-ROCm oracle | **MET (2026-08-19)** — pinned vLLM-ROCm oracle builds + runs on the APU; the 16-prompt near-tie gate PASSES 16/16 (13/16 strict token-exact vs per-prompt greedy, 3/16 in the 0-nat near-tie band, 0 forward-divergent, 0 declines). Fresh gfx1151 oracle capture is fully deterministic over K=10 | §3 M4 subsection; `m4-gate-20260819-102238.log` + `gap.log` on the node; matches the gfx1200/gfx1100 gate standard |
-| M5 — speed | **PARTIAL (2026-08-21)** — evidence chain §M5-1…M5-5: paired bench, context sweep (exact linear 20 ms + 0.042 ms×L), granularity probe (A/B null), **D128 arm 2.7–3.7× (near-tie-safe, 0.125 nats max)**, binding-grid ours leg (c1 43.5, c4 914 total). Oracle leg in flight | §M5-1…M5-5; jobs `bench-*` + `kv-pattern` + `d128-classify` on gtr9 |
+| M5 — speed | **PARTIAL (2026-08-21)** — evidence chain §M5-1…M5-5: paired bench, context sweep (exact linear 20 ms + 0.042 ms×L), granularity probe (A/B null), **D128 arm 2.7–3.7× (near-tie-safe, 0.125 nats max)**, binding-grid ours leg (c1 43.5, c4 914 total). **Oracle leg MET**: the flip landed upstream as #1589 carrying the re-captured golden pair — gate 16/16 prompts, 125/125 assertions, 0.125 nats max, 28 token flips vs the old golden; default-path bench 43.6 tok/s per-stream decode @1024-in c1, identical to the opt-in numbers | §M5-1…M5-5; jobs `bench-*` + `kv-pattern` + `d128-classify` on gtr9; #1589 |
 
 **Local datapoint (this workspace, 2026-08-19):** `build-hip-gfx1151/` is a
 configured Release tree with `ROCM_PATH=/usr` (an Arch/TheRock-style layout),
@@ -284,12 +284,14 @@ state and known holes:
 - **Native families present:** rmsnorm, dense basics, embedding, fp8 channel
   GEMV, GDN conv/postconv/scan/state/fused, Gemma-4 experts, hipBLASLt GEMM,
   MoE router, paged attention, sampling — 44 distinct registrations.
-- **d=128 decode is default OFF.** The arm that fixed the Qwen3-shaped decode
-  gap (`VT_ATTN_DECODE_D128`, #767, 3.53x on gfx1200) ships opt-in because its
-  reduction order can move a greedy anchor at a bf16 tie. An M5 bench on any
-  d=128 model runs `PagedAttnOnline` unless the flag is set — and flipping the
-  default is a separate per-backend argument with a distributional gate, not a
-  bench-time decision.
+- **d=128 decode is default ON (since #1589).** The arm that fixed the
+  Qwen3-shaped decode gap (`VT_ATTN_DECODE_D128`, #767, 3.53x on gfx1200)
+  shipped opt-in because its reduction order can move a greedy anchor at a bf16
+  tie; the flip to default ON landed upstream as #1589 with the near-tie razor
+  + distributional gate (16/16 prompts, 0.125 nats max, 0 forward-divergent)
+  and the re-captured device golden pair. Opt out with `VT_ATTN_DECODE_D128=0`.
+  This bullet was written before the flip; the M5-1/M5-2 numbers below predate
+  it and were measured on the fallback path.
 - **d=128 prefill still falls back** to the decode-shaped launch
   (`rocm-decode-attn-d128.md` §4/Owed); f32 d=128 decode is bf16-only today;
   GQA=4 fusion is open. None of these block a benchmark, all of them show up
@@ -491,12 +493,14 @@ widens with L — so the fixed 20 ms term is as suspicious as the linear one.
 
 ## M5-3 — D128 GQA decode arm: 2.7–3.7×, and the fallback was the culprit (2026-08-21)
 
-**The sweep ran the FALLBACK kernel.** The dispatch site (rocm_paged_attn.hip
-~l.1721) keeps the d=128 GQA decode (`PagedAttnDecodeGqaBf16`) behind
-`VT_ATTN_DECODE_D128=1`, DEFAULT OFF for byte-exactness (#382): "before this,
-bf16 decode at d==128 fell all the way to the generic PagedAttnOnline (#488
-measured that fallback at 41.1us/call against vLLM's 5.10us on gfx1200)".
+**The sweep ran the FALLBACK kernel.** At measurement time the dispatch site
+(rocm_paged_attn.hip ~l.1721) kept the d=128 GQA decode (`PagedAttnDecodeGqaBf16`)
+behind `VT_ATTN_DECODE_D128=1`, DEFAULT OFF for byte-exactness (#382): "before
+this, bf16 decode at d==128 fell all the way to the generic PagedAttnOnline
+(#488 measured that fallback at 41.1us/call against vLLM's 5.10us on gfx1200)".
 Qwen3-0.6B is d=128 → **every M5-1/M5-2 number above is the FALLBACK path**.
+The flip to default ON has since landed upstream (#1589); these M5-1/M5-2
+measurements remain the fallback-path baseline.
 
 Re-run of the same bench with `VT_ATTN_DECODE_D128=1` (job
 `repro/bench-d128-job.yaml`, no rebuild — env flag on the existing binary,
@@ -536,7 +540,9 @@ for that lever.**
 flipping VT_ATTN_DECODE_D128 ON (the #382 byte-exactness reason: warp-strided
 online softmax reduces KV in a different order, so a greedy anchor can move
 at an exact bf16 tie — measure, don't assume); (b) the binding grid
-(median-of-3 oracle + c-grid) on the D128 arm.
+(median-of-3 oracle + c-grid) on the D128 arm. **Both since discharged**: (a)
+shipped with the upstream flip (#1589 — 16/16 prompts, 125/125 assertions,
+0.125 nats max); (b) is the M5-5 table below.
 
 ## M5-4 — D128 parity verdict: near-tie only, no forward divergence (2026-08-21)
 
@@ -560,10 +566,12 @@ Artifact: `/home/kairos/d128-gap/qwen3_greedy_0_6b/neartie_gap_mnats.npy`
 
 **Conclusion:** flipping `VT_ATTN_DECODE_D128` ON for Qwen3-0.6B is
 correctness-safe under this gate (near-tie only), worth 2.7–3.7× decode on
-gfx1151. The flip still owes the board-owner rituals: re-capture the device
-golden pair under D128, and the near-tie razor + distributional-gate sign-off
-(the #382 comment names them). The fallback's own divergence count was 28
-(M4 gap.log); D128's is 36 — more tie-flips, none outside the band.
+gfx1151. **The flip has landed upstream as #1589**, carrying the re-captured
+device golden pair under D128 and the near-tie razor + distributional-gate
+sign-off the #382 comment names (gate 16/16 prompts, 125/125 assertions,
+0.125 nats max, 0 forward-divergent; 28 token flips vs the old golden —
+prompts 1/3/5, all near-ties). The fallback's own divergence count was 28 (M4
+gap.log); D128's is 36 — more tie-flips, none outside the band.
 
 ## M5-5 — binding grid, ours leg on the D128 arm (2026-08-21)
 
@@ -623,11 +631,13 @@ run the gate under `VT_ATTN_DECODE_D128=1` with NO dump (the certified path):
 - Goldens promoted: `our_ids_rocm.npy` + `neartie_gap_mnats_rocm.npy`
   (live dir + fetched back to the flip branch; sha-verified).
 
-**The flip change** (branch `flip/rocm-d128-decode-default-on`, base
-`upstream/main` 3b76ccbf): `rocm_paged_attn.hip` `decode_d128` default OFF→ON
-(`return e == nullptr || e[0] != '0'`, opt out with `VT_ATTN_DECODE_D128=0`),
-+ the re-captured ROCm golden pair. CUDA arm untouched (stays OFF pending the
-same ceremony there).
+**The flip change** (`rocm_paged_attn.hip` `decode_d128` default OFF→ON,
+`return e == nullptr || e[0] != '0'`, opt out with `VT_ATTN_DECODE_D128=0`,
++ the re-captured ROCm golden pair) **landed upstream as #1589** = commit
+`c020347a`; the fork branch `flip/rocm-d128-decode-default-on` was since
+rebased onto `upstream/main` `bae0392d` (the flip commit auto-dropped as
+already-applied) and carries only the docs/spec on top. CUDA arm untouched
+(stays OFF pending the same ceremony there).
 
 **DEFAULT-ON VERIFIED on the box (job `repro/verify-flip-job.yaml`, built
 `rebuild-flip`):** gate on the default path (NO env) = 16/16 prompts,
@@ -643,8 +653,10 @@ the M5-5 D128 numbers (43.5/335). The shipped default now IS the D128 path.
   method, the regression curve, the probe verdict, the 2.7–3.7× D128 A/B, the
   near-tie parity verdict and the binding paired grid (ours-D128 vs oracle,
   c1+c4, median-of-3, fresh process per rep). The golden re-capture + razor
-  sign-off (M5-7) is DONE; the last item before posting is the default-on
-  rebuild verification + a default-on bench spot-check on the box.
+  sign-off (M5-7) is DONE, and the default-on rebuild verification + default-on
+  bench spot-check are DONE (M5-7, verified on the box); the flip then landed
+  upstream as #1589. The remaining gap for M5 MET is the ~2.1× decode gap
+  (43.5 vs 91.5 tok/s at c1) named in M5-6 — GPU-gated work.
 - The gfx1151 datapoints in §2/§3 (F6 verification, M2, M4 oracle gate) are
   now VERIFIED on the box but stay PENDING-community until posted — per §7
   of ROCM.md, a gate you cannot run stays PENDING, and that is the
